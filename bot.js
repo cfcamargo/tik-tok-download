@@ -1,15 +1,29 @@
 // bot.js
 require('dotenv').config();
 
+const isProd = process.env.NODE_ENV === 'production';
+console.log('[ENV] isProd =', isProd);
+
 const TelegramBot = require('node-telegram-bot-api');
-const http = require("node:http");
-const https = require("node:https");
-const { URL } = require("node:url");
+const http = require('node:http');
+const https = require('node:https');
+const { URL } = require('node:url');
 const scraper = require('btch-downloader');
 
-const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
 const ffmpeg = require('fluent-ffmpeg');
-ffmpeg.setFfmpegPath(ffmpegPath);
+
+// ---- FFmpeg/FFprobe paths ----
+if (isProd) {
+  // Produção: usar binários do sistema (ex.: Docker com apk/apt add ffmpeg)
+  ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH || '/usr/bin/ffmpeg');
+  ffmpeg.setFfprobePath(process.env.FFPROBE_PATH || '/usr/bin/ffprobe');
+} else {
+  // Dev: usar pacotes npm
+  const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
+  const ffprobeStatic = require('ffprobe-static');
+  ffmpeg.setFfmpegPath(ffmpegPath);
+  ffmpeg.setFfprobePath(ffprobeStatic.path);
+}
 
 const fs = require('node:fs/promises');
 const fsSync = require('node:fs');
@@ -20,7 +34,14 @@ const crypto = require('node:crypto');
 // ===================================================================================
 // Config / ACL por @username (via .env)
 // ===================================================================================
-const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
+const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: false, filepath: false });
+
+// Lock simples para evitar dupla inicialização (ex.: nodemon)
+if (globalThis.__BOT_RUNNING__) {
+  console.log('[BOT] Já inicializado. Encerrando esta instância para evitar duplicação.');
+  process.exit(0);
+}
+globalThis.__BOT_RUNNING__ = true;
 
 function normalizeUsername(u) {
   return String(u || '').trim().replace(/^@/, '').toLowerCase();
@@ -64,40 +85,40 @@ const META_STEPS = [
 ];
 
 // ===================================================================================
-// Utils de stream / download
+/* Utils de stream / download */
 // ===================================================================================
 function streamToBuffer(stream, maxBytes) {
   return new Promise((resolve, reject) => {
     const chunks = []; let total = 0;
-    stream.on("data", (chunk) => {
+    stream.on('data', (chunk) => {
       const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       total += buf.length;
-      if (typeof maxBytes === "number" && total > maxBytes) {
+      if (typeof maxBytes === 'number' && total > maxBytes) {
         stream.destroy();
         reject(new Error(`Response too large (> ${maxBytes} bytes)`));
         return;
       }
       chunks.push(buf);
     });
-    stream.once("end", () => resolve(Buffer.concat(chunks)));
-    stream.once("error", reject);
+    stream.once('end', () => resolve(Buffer.concat(chunks)));
+    stream.once('error', reject);
   });
 }
 
 function getStream(urlStr, { maxRedirects = 5, timeoutMs = 30000 } = {}) {
-  if (maxRedirects < 0) return Promise.reject(new Error("Too many redirects"));
+  if (maxRedirects < 0) return Promise.reject(new Error('Too many redirects'));
   const u = new URL(urlStr);
-  const isHttps = u.protocol === "https:";
+  const isHttps = u.protocol === 'https:';
   const client = isHttps ? https : http;
 
   return new Promise((resolve, reject) => {
     const req = client.request(
       {
-        method: "GET",
+        method: 'GET',
         hostname: u.hostname,
         port: u.port || (isHttps ? 443 : 80),
         path: u.pathname + u.search,
-        headers: { "User-Agent": "Mozilla/5.0", "Accept": "*/*" },
+        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': '*/*' },
       },
       (res) => {
         const status = res.statusCode || 0;
@@ -116,13 +137,13 @@ function getStream(urlStr, { maxRedirects = 5, timeoutMs = 30000 } = {}) {
           return;
         }
 
-        res._contentType = res.headers["content-type"] || "";
+        res._contentType = res.headers['content-type'] || '';
         resolve(res);
       }
     );
 
-    req.setTimeout(timeoutMs, () => req.destroy(new Error("Request timeout")));
-    req.on("error", reject);
+    req.setTimeout(timeoutMs, () => req.destroy(new Error('Request timeout')));
+    req.on('error', reject);
     req.end();
   });
 }
@@ -135,12 +156,12 @@ async function downloadToBufferWithType(url, opts = {}) {
 }
 
 // Helpers gerais
-function extractFirstUrl(text = "") {
+function extractFirstUrl(text = '') {
   const m = text.match(/https?:\/\/\S+/i);
   return m ? m[0].replace(/[)\]}>"'\s]+$/, '') : null;
 }
 
-function sanitizeMetaValue(v = "") {
+function sanitizeMetaValue(v = '') {
   // remove quebras de linha e '='; se ficar vazio, retorna undefined (pular)
   const cleaned = String(v)
     .replace(/[\r\n]+/g, ' ')
@@ -262,13 +283,11 @@ async function askCurrentStep(chatId) {
 }
 
 // ===================================================================================
-// Fluxo principal: qualquer mensagem
+// Handlers
 // ===================================================================================
 bot.on('message', async (msg) => {
-  // ACL
   if (!isAllowed(msg)) return replyNotAllowed(msg);
 
-  // ignora mensagens sem texto
   const text = (msg.text || '').trim();
   const chatId = msg.chat.id;
 
@@ -291,9 +310,7 @@ bot.on('message', async (msg) => {
     } else {
       const step = META_STEPS[s.stepIndex];
       const val = sanitizeMetaValue(text);
-      if (val !== undefined) {
-        s.meta[step.key] = val; // se vazio, considera "pulado"
-      }
+      if (val !== undefined) s.meta[step.key] = val; // se vazio, considera "pulado"
       s.stepIndex++;
     }
 
@@ -304,7 +321,6 @@ bot.on('message', async (msg) => {
         await bot.sendChatAction(chatId, 'upload_video');
 
         const directUrl = await resolveDirectVideoUrl(s.pendingUrl);
-
         const { buffer, contentType } = await downloadToBufferWithType(directUrl, {
           maxRedirects: 5,
           timeoutMs: 30000,
@@ -340,7 +356,6 @@ bot.on('message', async (msg) => {
   // Não estamos aguardando meta: tenta detectar URL na mensagem
   const url = extractFirstUrl(text);
   if (!url) {
-    // Sem link → manda instruções (para mensagens curtas)
     if (text && text.length < 60) await sendInstructions(chatId);
     return;
   }
@@ -354,5 +369,33 @@ bot.on('message', async (msg) => {
   );
   await askCurrentStep(chatId);
 });
+
+// ===================================================================================
+// Boot: remover webhook (qualquer versão) e iniciar polling (evita 409)
+// ===================================================================================
+(async () => {
+  try {
+    // compat: algumas versões usam deleteWebHook (H maiúsculo), outras deleteWebhook
+    if (typeof bot.deleteWebHook === 'function') {
+      await bot.deleteWebHook({ drop_pending_updates: true });
+    } else if (typeof bot.deleteWebhook === 'function') {
+      await bot.deleteWebhook({ drop_pending_updates: true });
+    } else if (typeof bot.setWebHook === 'function') {
+      // fallback: limpar webhook definindo vazio
+      await bot.setWebHook('', { drop_pending_updates: true });
+    }
+
+    await bot.startPolling();
+    console.log('[BOT] Polling iniciado.');
+  } catch (e) {
+    console.error('[BOT] Falha ao iniciar polling:', e);
+    process.exit(1);
+  }
+})();
+
+// Encerramento limpo (evita sessão paralela em redeploy)
+process.on('SIGTERM', async () => { try { await bot.stopPolling(); } catch { } process.exit(0); });
+process.on('SIGINT', async () => { try { await bot.stopPolling(); } catch { } process.exit(0); });
+
 
 console.log('✅ Bot rodando. Pressione Ctrl+C para encerrar.');
