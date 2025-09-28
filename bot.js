@@ -10,33 +10,70 @@ const https = require('node:https');
 const { URL } = require('node:url');
 const scraper = require('btch-downloader');
 
-const ffmpeg = require('fluent-ffmpeg');
-
-// ---- FFmpeg/FFprobe paths ----
-if (isProd) {
-  // Produção: usar binários do sistema (ex.: Docker com apk/apt add ffmpeg)
-  ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH || '/usr/bin/ffmpeg');
-  ffmpeg.setFfprobePath(process.env.FFPROBE_PATH || '/usr/bin/ffprobe');
-} else {
-  // Dev: usar pacotes npm
-  const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
-  const ffprobeStatic = require('ffprobe-static');
-  ffmpeg.setFfmpegPath(ffmpegPath);
-  ffmpeg.setFfprobePath(ffprobeStatic.path);
-}
-
 const fs = require('node:fs/promises');
 const fsSync = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { execFile } = require('node:child_process');
+
+// ===================================================================================
+// FFmpeg / FFprobe: paths e checagens
+// ===================================================================================
+const ffmpeg = require('fluent-ffmpeg');
+
+// tenta usar envs (Dockerfile define /usr/bin/ffmpeg/ffprobe em produção)
+let ffmpegPath = process.env.FFMPEG_PATH || (isProd ? '/usr/bin/ffmpeg' : null);
+let ffprobePath = process.env.FFPROBE_PATH || (isProd ? '/usr/bin/ffprobe' : null);
+
+// fallback em DEV: pacotes npm
+if (!ffmpegPath || !fsSync.existsSync(ffmpegPath)) {
+  try {
+    const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg'); // devDependency
+    if (ffmpegInstaller?.path && fsSync.existsSync(ffmpegInstaller.path)) {
+      ffmpegPath = ffmpegInstaller.path;
+    }
+  } catch (_) { }
+}
+if (!ffprobePath || !fsSync.existsSync(ffprobePath)) {
+  try {
+    const ffprobeStatic = require('ffprobe-static'); // devDependency
+    if (ffprobeStatic?.path && fsSync.existsSync(ffprobeStatic.path)) {
+      ffprobePath = ffprobeStatic.path;
+    }
+  } catch (_) { }
+}
+
+// aplica nos paths do fluent-ffmpeg (se achou)
+if (ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
+if (ffprobePath) ffmpeg.setFfprobePath(ffprobePath);
+
+// logs úteis
+console.log('[FFMPEG] ffmpegPath:', ffmpegPath || '(não definido)');
+console.log('[FFMPEG] ffprobePath:', ffprobePath || '(não definido)');
+
+// checagem em runtime – ajuda a diagnosticar ENOENT cedo
+execFile(ffmpegPath || 'ffmpeg', ['-version'], (e, out) => {
+  if (e) console.error('[FFMPEG] ffmpeg indisponível:', e.message);
+  else console.log('[FFMPEG]', (out || '').split('\n')[0]);
+});
+execFile(ffprobePath || 'ffprobe', ['-version'], (e, out) => {
+  if (e) console.error('[FFMPEG] ffprobe indisponível:', e.message);
+  else console.log('[FFPROBE]', (out || '').split('\n')[0]);
+});
 
 // ===================================================================================
 // Config / ACL por @username (via .env)
 // ===================================================================================
-const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: false, filepath: false });
+const TOKEN = process.env.TELEGRAM_TOKEN;
+if (!TOKEN) {
+  console.error('[BOT] Faltou TELEGRAM_TOKEN no .env/ambiente.');
+  process.exit(1);
+}
 
-// Lock simples para evitar dupla inicialização (ex.: nodemon)
+const bot = new TelegramBot(TOKEN, { polling: false, filepath: false });
+
+// Lock anti-duplicação (ex.: nodemon)
 if (globalThis.__BOT_RUNNING__) {
   console.log('[BOT] Já inicializado. Encerrando esta instância para evitar duplicação.');
   process.exit(0);
@@ -85,7 +122,7 @@ const META_STEPS = [
 ];
 
 // ===================================================================================
-/* Utils de stream / download */
+// Utils de stream / download
 // ===================================================================================
 function streamToBuffer(stream, maxBytes) {
   return new Promise((resolve, reject) => {
@@ -253,6 +290,10 @@ async function rewriteVideoMetadata(inputBuffer, meta = {}) {
 // ===================================================================================
 // Mensagens de ajuda / passos
 // ===================================================================================
+function shouldSkipAllMeta(text = '') {
+  return /(^|[\s])\/pulartodos([\s]|$)/i.test(text) || /#pulartodos/i.test(text);
+}
+
 async function sendInstructions(chatId) {
   const text =
     `Envie **um link** do TikTok (ou uma URL direta .mp4).
@@ -267,6 +308,7 @@ Eu vou perguntar os metadados **um por vez**:
 A **data** será preenchida automaticamente com a data de hoje.
 
 Comandos:
+• /pulartodos — pular todos os metadados e enviar do jeito que está
 • /pular — pula o campo atual
 • /cancelar — cancela o processo (também vale /cancel)`;
   await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
@@ -277,13 +319,13 @@ async function askCurrentStep(chatId) {
   const step = META_STEPS[s.stepIndex];
   await bot.sendMessage(
     chatId,
-    `Me envie o **${step.label}**.\n(Digite /pular para deixar em branco, ou /cancelar para cancelar)`,
+    `Me envie o **${step.label}**.\n(Digite /pular para deixar em branco, /pulartodos para pular todos, ou /cancelar para cancelar)`,
     { parse_mode: 'Markdown' }
   );
 }
 
 // ===================================================================================
-// Handlers
+// Handler principal
 // ===================================================================================
 bot.on('message', async (msg) => {
   if (!isAllowed(msg)) return replyNotAllowed(msg);
@@ -305,7 +347,11 @@ bot.on('message', async (msg) => {
   // Se estamos aguardando o valor de um campo de metadado
   const s = state.get(chatId);
   if (s && s.awaiting) {
-    if (/^\/pular\b/i.test(text)) {
+    // pular TODOS os metadados
+    if (shouldSkipAllMeta(text)) {
+      s.stepIndex = META_STEPS.length; // força concluir
+    }
+    else if (/^\/pular\b/i.test(text)) {
       s.stepIndex++;
     } else {
       const step = META_STEPS[s.stepIndex];
@@ -332,7 +378,7 @@ bot.on('message', async (msg) => {
           return;
         }
 
-        const finalMeta = buildFinalMeta(s.meta);
+        const finalMeta = buildFinalMeta(s.meta); // pode estar vazio, ok!
         const processed = await rewriteVideoMetadata(buffer, finalMeta);
 
         await bot.sendVideo(
@@ -362,26 +408,33 @@ bot.on('message', async (msg) => {
 
   // Inicia o fluxo de metadados
   state.set(chatId, { awaiting: true, pendingUrl: url, stepIndex: 0, meta: {} });
+
+  // Se a mensagem já pediu para pular todos, processe direto
+  if (shouldSkipAllMeta(text)) {
+    const s2 = state.get(chatId);
+    s2.stepIndex = META_STEPS.length; // força concluir
+    const fakeMsg = { ...msg, text: '/pulartodos' };
+    return bot.emit('message', fakeMsg);
+  }
+
   await bot.sendMessage(
     chatId,
     'Link recebido! Vou perguntar os metadados um por vez.\n' +
-    'Você pode usar /pular para deixar algum em branco ou /cancelar para cancelar.'
+    'Você pode usar /pular para deixar algum em branco, /pulartodos para pular todos, ou /cancelar para cancelar.'
   );
   await askCurrentStep(chatId);
 });
 
 // ===================================================================================
-// Boot: remover webhook (qualquer versão) e iniciar polling (evita 409)
+// Boot: remover webhook e iniciar polling (compat com versões)
 // ===================================================================================
 (async () => {
   try {
-    // compat: algumas versões usam deleteWebHook (H maiúsculo), outras deleteWebhook
     if (typeof bot.deleteWebHook === 'function') {
       await bot.deleteWebHook({ drop_pending_updates: true });
     } else if (typeof bot.deleteWebhook === 'function') {
       await bot.deleteWebhook({ drop_pending_updates: true });
     } else if (typeof bot.setWebHook === 'function') {
-      // fallback: limpar webhook definindo vazio
       await bot.setWebHook('', { drop_pending_updates: true });
     }
 
@@ -396,6 +449,5 @@ bot.on('message', async (msg) => {
 // Encerramento limpo (evita sessão paralela em redeploy)
 process.on('SIGTERM', async () => { try { await bot.stopPolling(); } catch { } process.exit(0); });
 process.on('SIGINT', async () => { try { await bot.stopPolling(); } catch { } process.exit(0); });
-
 
 console.log('✅ Bot rodando. Pressione Ctrl+C para encerrar.');
