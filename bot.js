@@ -63,6 +63,21 @@ execFile(ffprobePath || 'ffprobe', ['-version'], (e, out) => {
 });
 
 // ===================================================================================
+/** Config de rede/timeout — pode ajustar por ENV no Coolify
+ *  DOWNLOAD_TIMEOUT_MS: deadline total por requisição (default 90s)
+ *  DOWNLOAD_HEADER_TIMEOUT_MS: tempo p/ receber headers (default 20s)
+ *  DOWNLOAD_MAX_RETRIES: tentativas (default 3)
+ *  DOWNLOAD_RETRY_BASE_MS: backoff base (default 800ms)
+ */
+const DOWNLOAD_TIMEOUT_MS = Number(process.env.DOWNLOAD_TIMEOUT_MS || 90000);
+const DOWNLOAD_HEADER_TIMEOUT_MS = Number(process.env.DOWNLOAD_HEADER_TIMEOUT_MS || 20000);
+const DOWNLOAD_MAX_RETRIES = Number(process.env.DOWNLOAD_MAX_RETRIES || 3);
+const DOWNLOAD_RETRY_BASE_MS = Number(process.env.DOWNLOAD_RETRY_BASE_MS || 800);
+
+const HTTP_AGENT = new http.Agent({ keepAlive: true, maxSockets: 20 });
+const HTTPS_AGENT = new https.Agent({ keepAlive: true, maxSockets: 20 });
+
+// ===================================================================================
 // Config / ACL por @username (via .env)
 // ===================================================================================
 const TOKEN = process.env.TELEGRAM_TOKEN;
@@ -122,8 +137,108 @@ const META_STEPS = [
 ];
 
 // ===================================================================================
-// Utils de stream / download
+// Utils de stream / download (com retries/backoff/IPv4)
 // ===================================================================================
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function getStream(urlStr, opts = {}) {
+  const {
+    maxRedirects = 5,
+    timeoutMs = DOWNLOAD_TIMEOUT_MS,
+    headerTimeoutMs = DOWNLOAD_HEADER_TIMEOUT_MS,
+    attempt = 1,
+    maxRetries = DOWNLOAD_MAX_RETRIES,
+  } = opts;
+
+  if (maxRedirects < 0) throw new Error('Too many redirects');
+
+  const url = new URL(urlStr);
+  const isHttps = url.protocol === 'https:';
+  const client = isHttps ? https : http;
+  const agent = isHttps ? HTTPS_AGENT : HTTP_AGENT;
+
+  const headers = {
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+      '(KHTML, like Gecko) Chrome/125 Safari/537.36',
+    'Accept': '*/*',
+    'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Referer': 'https://www.tiktok.com/',
+  };
+
+  const overallDeadline = Date.now() + timeoutMs;
+
+  const doRequest = () =>
+    new Promise((resolve, reject) => {
+      const req = client.request(
+        {
+          method: 'GET',
+          hostname: url.hostname,
+          port: url.port || (isHttps ? 443 : 80),
+          path: url.pathname + url.search,
+          headers,
+          agent,
+          family: 4, // força IPv4
+        },
+        (res) => {
+          const status = res.statusCode || 0;
+
+          if (status >= 300 && status < 400 && res.headers.location) {
+            const next = new URL(res.headers.location, url).toString();
+            res.resume();
+            getStream(next, {
+              ...opts,
+              maxRedirects: maxRedirects - 1,
+              timeoutMs: Math.max(1000, overallDeadline - Date.now()),
+            }).then(resolve).catch(reject);
+            return;
+          }
+
+          if (status < 200 || status >= 300) {
+            res.resume();
+            reject(new Error(`Request failed with status ${status}`));
+            return;
+          }
+
+          res._contentType = res.headers['content-type'] || '';
+          resolve(res);
+        }
+      );
+
+      // Timeout para cabeçalhos
+      req.setTimeout(
+        Math.min(headerTimeoutMs, Math.max(1, overallDeadline - Date.now())),
+        () => req.destroy(new Error('Header timeout'))
+      );
+
+      // Deadline total
+      const overallTimer = setTimeout(() => {
+        req.destroy(new Error('Request timeout'));
+      }, Math.max(1, overallDeadline - Date.now()));
+
+      req.on('error', (e) => {
+        clearTimeout(overallTimer);
+        reject(e);
+      });
+
+      req.end();
+    });
+
+  try {
+    return await doRequest();
+  } catch (err) {
+    if (attempt < maxRetries) {
+      const backoff = DOWNLOAD_RETRY_BASE_MS * Math.pow(2, attempt - 1);
+      console.warn(
+        `[HTTP] Falha (tentativa ${attempt}/${maxRetries}): ${err.message} — retry em ${backoff}ms`
+      );
+      await sleep(backoff);
+      return getStream(urlStr, { ...opts, attempt: attempt + 1 });
+    }
+    throw err;
+  }
+}
+
 function streamToBuffer(stream, maxBytes) {
   return new Promise((resolve, reject) => {
     const chunks = []; let total = 0;
@@ -139,49 +254,6 @@ function streamToBuffer(stream, maxBytes) {
     });
     stream.once('end', () => resolve(Buffer.concat(chunks)));
     stream.once('error', reject);
-  });
-}
-
-function getStream(urlStr, { maxRedirects = 5, timeoutMs = 30000 } = {}) {
-  if (maxRedirects < 0) return Promise.reject(new Error('Too many redirects'));
-  const u = new URL(urlStr);
-  const isHttps = u.protocol === 'https:';
-  const client = isHttps ? https : http;
-
-  return new Promise((resolve, reject) => {
-    const req = client.request(
-      {
-        method: 'GET',
-        hostname: u.hostname,
-        port: u.port || (isHttps ? 443 : 80),
-        path: u.pathname + u.search,
-        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': '*/*' },
-      },
-      (res) => {
-        const status = res.statusCode || 0;
-
-        if (status >= 300 && status < 400 && res.headers.location) {
-          const next = new URL(res.headers.location, u).toString();
-          res.resume();
-          getStream(next, { maxRedirects: maxRedirects - 1, timeoutMs })
-            .then(resolve).catch(reject);
-          return;
-        }
-
-        if (status < 200 || status >= 300) {
-          res.resume();
-          reject(new Error(`Request failed with status ${status}`));
-          return;
-        }
-
-        res._contentType = res.headers['content-type'] || '';
-        resolve(res);
-      }
-    );
-
-    req.setTimeout(timeoutMs, () => req.destroy(new Error('Request timeout')));
-    req.on('error', reject);
-    req.end();
   });
 }
 
@@ -369,7 +441,9 @@ bot.on('message', async (msg) => {
         const directUrl = await resolveDirectVideoUrl(s.pendingUrl);
         const { buffer, contentType } = await downloadToBufferWithType(directUrl, {
           maxRedirects: 5,
-          timeoutMs: 30000,
+          timeoutMs: DOWNLOAD_TIMEOUT_MS,
+          headerTimeoutMs: DOWNLOAD_HEADER_TIMEOUT_MS,
+          maxRetries: DOWNLOAD_MAX_RETRIES,
           maxBytes: 49 * 1024 * 1024
         });
 
