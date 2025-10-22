@@ -29,9 +29,15 @@ const HTTPS_AGENT = new https.Agent({ keepAlive: true, maxSockets: 20 });
 // ===================================================================================
 // FFmpeg / YT-DLP: Configuração dos Binários
 // ===================================================================================
+// Dev
+// let ffmpegPath = process.env.FFMPEG_PATH || 'ffmpeg';
+// const YTDLP_PATH = process.env.YTDLP_PATH || 'yt-dlp'; 
 
+//Production
 let ffmpegPath = process.env.FFMPEG_PATH || 'ffmpeg';
-const YTDLP_PATH = process.env.YTDLP_PATH || 'yt-dlp'; 
+const YTDLP_PATH = process.env.YTDLP_PATH || '/usr/local/bin/yt-dlp';
+
+
 
 // Tenta verificar se os binários estão disponíveis (para fins de log e diagnóstico)
 execFile(YTDLP_PATH, ['--version'], (e, out) => {
