@@ -46,5 +46,10 @@ ENV NODE_ENV production
 ENV YTDLP_PATH yt-dlp
 ENV FFMPEG_PATH ffmpeg
 
+# HEALTHCHECK explícito:
+# Inicia a checagem após 5s e verifica a cada 5s se o processo "node" está rodando.
+HEALTHCHECK --interval=5s --timeout=3s --start-period=5s \
+  CMD ps aux | grep -v grep | grep node || exit 1
+
 # === 5. COMANDO DE INICIALIZAÇÃO ===
 CMD ["node", "bot.js"]
