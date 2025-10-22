@@ -8,74 +8,40 @@ const TelegramBot = require('node-telegram-bot-api');
 const http = require('node:http');
 const https = require('node:https');
 const { URL } = require('node:url');
-const scraper = require('btch-downloader');
-
-const fs = require('node:fs/promises');
 const fsSync = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
-const crypto = require('node:crypto');
 const { execFile } = require('node:child_process');
 
-// ===================================================================================
-// FFmpeg / FFprobe: paths e checagens
-// ===================================================================================
-const ffmpeg = require('fluent-ffmpeg');
-
-// tenta usar envs (Dockerfile define /usr/bin/ffmpeg/ffprobe em produção)
-let ffmpegPath = process.env.FFMPEG_PATH || (isProd ? '/usr/bin/ffmpeg' : null);
-let ffprobePath = process.env.FFPROBE_PATH || (isProd ? '/usr/bin/ffprobe' : null);
-
-// fallback em DEV: pacotes npm
-if (!ffmpegPath || !fsSync.existsSync(ffmpegPath)) {
-  try {
-    const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg'); // devDependency
-    if (ffmpegInstaller?.path && fsSync.existsSync(ffmpegInstaller.path)) {
-      ffmpegPath = ffmpegInstaller.path;
-    }
-  } catch (_) { }
-}
-if (!ffprobePath || !fsSync.existsSync(ffprobePath)) {
-  try {
-    const ffprobeStatic = require('ffprobe-static'); // devDependency
-    if (ffprobeStatic?.path && fsSync.existsSync(ffprobeStatic.path)) {
-      ffprobePath = ffprobeStatic.path;
-    }
-  } catch (_) { }
-}
-
-// aplica nos paths do fluent-ffmpeg (se achou)
-if (ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
-if (ffprobePath) ffmpeg.setFfprobePath(ffprobePath);
-
-// logs úteis
-console.log('[FFMPEG] ffmpegPath:', ffmpegPath || '(não definido)');
-console.log('[FFMPEG] ffprobePath:', ffprobePath || '(não definido)');
-
-// checagem em runtime – ajuda a diagnosticar ENOENT cedo
-execFile(ffmpegPath || 'ffmpeg', ['-version'], (e, out) => {
-  if (e) console.error('[FFMPEG] ffmpeg indisponível:', e.message);
-  else console.log('[FFMPEG]', (out || '').split('\n')[0]);
-});
-execFile(ffprobePath || 'ffprobe', ['-version'], (e, out) => {
-  if (e) console.error('[FFMPEG] ffprobe indisponível:', e.message);
-  else console.log('[FFPROBE]', (out || '').split('\n')[0]);
-});
+// === BIBLIOTECAS DE SCRAPER NODE.JS ===
+const scraper = require('btch-downloader'); // Usado apenas para TikTok
 
 // ===================================================================================
-/** Config de rede/timeout — pode ajustar por ENV no Coolify
- *  DOWNLOAD_TIMEOUT_MS: deadline total por requisição (default 90s)
- *  DOWNLOAD_HEADER_TIMEOUT_MS: tempo p/ receber headers (default 20s)
- *  DOWNLOAD_MAX_RETRIES: tentativas (default 3)
- *  DOWNLOAD_RETRY_BASE_MS: backoff base (default 800ms)
- */
+// Configurações de Download e Agentes
+// ===================================================================================
 const DOWNLOAD_TIMEOUT_MS = Number(process.env.DOWNLOAD_TIMEOUT_MS || 90000);
 const DOWNLOAD_HEADER_TIMEOUT_MS = Number(process.env.DOWNLOAD_HEADER_TIMEOUT_MS || 20000);
 const DOWNLOAD_MAX_RETRIES = Number(process.env.DOWNLOAD_MAX_RETRIES || 3);
 const DOWNLOAD_RETRY_BASE_MS = Number(process.env.DOWNLOAD_RETRY_BASE_MS || 800);
+const TELEGRAM_FILE_MAX_BYTES = 49 * 1024 * 1024; // Limite do Telegram (50MB)
 
 const HTTP_AGENT = new http.Agent({ keepAlive: true, maxSockets: 20 });
 const HTTPS_AGENT = new https.Agent({ keepAlive: true, maxSockets: 20 });
+
+// ===================================================================================
+// FFmpeg / YT-DLP: Configuração dos Binários
+// ===================================================================================
+
+let ffmpegPath = process.env.FFMPEG_PATH || 'ffmpeg';
+const YTDLP_PATH = process.env.YTDLP_PATH || 'yt-dlp'; 
+
+// Tenta verificar se os binários estão disponíveis (para fins de log e diagnóstico)
+execFile(YTDLP_PATH, ['--version'], (e, out) => {
+  if (e) console.error('[YT-DLP] yt-dlp indisponível: certifique-se que está instalado via pip.', e.message);
+  else console.log('[YT-DLP] Versão:', (out || '').split('\n')[0]);
+});
+execFile(ffmpegPath, ['-version'], (e, out) => {
+  if (e) console.error('[FFMPEG] FFmpeg indisponível: certifique-se que está instalado no sistema.', e.message);
+  else console.log('[FFMPEG] Versão:', (out || '').split('\n')[0].match(/ffmpeg version \S+/i)?.[0] || 'OK');
+});
 
 // ===================================================================================
 // Config / ACL por @username (via .env)
@@ -88,7 +54,7 @@ if (!TOKEN) {
 
 const bot = new TelegramBot(TOKEN, { polling: false, filepath: false });
 
-// Lock anti-duplicação (ex.: nodemon)
+// Lock anti-duplicação
 if (globalThis.__BOT_RUNNING__) {
   console.log('[BOT] Já inicializado. Encerrando esta instância para evitar duplicação.');
   process.exit(0);
@@ -122,22 +88,7 @@ async function replyNotAllowed(msg) {
 }
 
 // ===================================================================================
-// Estado por chat para coletar metadados passo a passo
-// ===================================================================================
-/** state: chatId -> { awaiting: boolean, pendingUrl: string, stepIndex: number, meta: Record<string,string> } */
-const state = new Map();
-
-// Ordem dos campos de metadados (sem "date" — será preenchida automaticamente)
-const META_STEPS = [
-  { key: 'title', label: 'título' },
-  { key: 'artist', label: 'artista' },
-  { key: 'comment', label: 'comentário' },
-  { key: 'description', label: 'descrição' },
-  { key: 'genre', label: 'gênero' },
-];
-
-// ===================================================================================
-// Utils de stream / download (com retries/backoff/IPv4)
+// Utils de stream / download (Usado para BTCH-DOWNLOADER)
 // ===================================================================================
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -163,7 +114,7 @@ async function getStream(urlStr, opts = {}) {
       '(KHTML, like Gecko) Chrome/125 Safari/537.36',
     'Accept': '*/*',
     'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Referer': 'https://www.tiktok.com/',
+    'Referer': 'https://www.google.com/',
   };
 
   const overallDeadline = Date.now() + timeoutMs;
@@ -270,130 +221,90 @@ function extractFirstUrl(text = '') {
   return m ? m[0].replace(/[)\]}>"'\s]+$/, '') : null;
 }
 
-function sanitizeMetaValue(v = '') {
-  // remove quebras de linha e '='; se ficar vazio, retorna undefined (pular)
-  const cleaned = String(v)
-    .replace(/[\r\n]+/g, ' ')
-    .replace(/=/g, '-')
-    .trim();
-  return cleaned.length ? cleaned.slice(0, 200) : undefined;
-}
-
-function buildFinalMeta(meta = {}) {
-  const out = {};
-  for (const [k, v] of Object.entries(meta)) {
-    if (v !== undefined && v !== null && String(v).trim() !== '') {
-      out[k] = String(v).trim();
-    }
-  }
-  // Data automática YYYY-MM-DD
-  const today = new Date();
-  const yyyy = today.getFullYear();
-  const mm = String(today.getMonth() + 1).padStart(2, '0');
-  const dd = String(today.getDate()).padStart(2, '0');
-  out.date = `${yyyy}-${mm}-${dd}`;
-  return out;
-}
-
-// Resolve URL direta do vídeo (TikTok share → btch-downloader)
-async function resolveDirectVideoUrl(shareUrl) {
-  if (/\.mp4(\?|$)/i.test(shareUrl)) return shareUrl;
-
-  const result = await scraper.ttdl(shareUrl);
-  let candidate = null;
-
-  if (typeof result.video === 'string') {
-    candidate = result.video;
-  } else if (Array.isArray(result.video) && result.video.length) {
-    candidate = result.video[0];
-  } else if (result.video && typeof result.video === 'object') {
-    candidate = result.video.nowm || result.video.hd || result.video.sd || result.video.wm ||
-      result.video.url || result.video.link;
-    if (!candidate) {
-      const firstKey = Object.keys(result.video)[0];
-      candidate = result.video[firstKey];
-    }
-  }
-
-  if (!candidate || typeof candidate !== 'string') {
-    throw new Error('Não consegui resolver uma URL direta do vídeo.');
-  }
-  return candidate;
-}
-
 // ===================================================================================
-// FFmpeg: reescrever metadados (sem reencodar)
+// YT-DLP: Download de Mídia (Binário) - Para Pinterest/YouTube/Shorts
 // ===================================================================================
-async function rewriteVideoMetadata(inputBuffer, meta = {}) {
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tt-meta-'));
-  const inPath = path.join(tmpDir, crypto.randomBytes(6).toString('hex') + '.mp4');
-  const outPath = path.join(tmpDir, crypto.randomBytes(6).toString('hex') + '.mp4');
+async function downloadMediaWithYtdlp(url) {
+  // Estratégia Otimizada: Usa recodificação para forçar um MP4 estável e silencia o output.
+  const args = [
+    '-f', 'best', // Simplificado para o melhor formato disponível
+    '--recode-video', 'mp4', // CHAVE PARA ESTABILIDADE DO SHORTS
+    '-o', '-',
+    '--limit-rate', '5M', 
+    '--no-warnings', 
+    '--no-check-certificate', 
+    '--no-mtime', 
+    '--no-progress', 
+    '--quiet', 
+    '--ffmpeg-location', ffmpegPath, 
+    url
+  ];
 
-  try {
-    await fs.writeFile(inPath, inputBuffer);
+  return new Promise((resolve, reject) => {
+    const child = execFile(YTDLP_PATH, args, { 
+      encoding: 'buffer', 
+      maxBuffer: TELEGRAM_FILE_MAX_BYTES 
+    }, (error, stdout, stderr) => {
+        if (error) {
+            console.error('[YT-DLP] Erro (STDERR):', stderr.toString().substring(0, 500));
+            
+            const errorMessage = stderr.toString().includes('Requested format is not available') 
+                ? 'O conteúdo de vídeo está em um formato incomum. YT-DLP não conseguiu baixá-lo.'
+                : `O binário YT-DLP falhou. Código: ${error.code}.`;
 
-    await new Promise((resolve, reject) => {
-      let cmd = ffmpeg(inPath)
-        .outputOptions([
-          '-map_metadata', '-1',      // remove metadados originais
-          '-c', 'copy',               // sem reencode
-          '-movflags', '+faststart'   // bom para streaming/Telegram
-        ])
-        .on('error', reject)
-        .on('end', resolve);
+            return reject(new Error(errorMessage));
+        }
+        
+        const mediaBuffer = Buffer.from(stdout);
+        
+        if (mediaBuffer.length === 0) {
+             return reject(new Error("YT-DLP retornou um arquivo vazio."));
+        }
+        
+        // Inferência de Content-Type (Heurística)
+        let contentType = 'application/octet-stream';
+        const header = mediaBuffer.subarray(0, 4).toString('hex');
+        if (header.includes('ffd8')) {
+            contentType = 'image/jpeg';
+        } else if (header.includes('000000') && mediaBuffer.subarray(4, 8).toString().includes('ftyp')) {
+            contentType = 'video/mp4';
+        } else if (mediaBuffer.length > 2 * 1024 * 1024) { 
+             contentType = 'video/mp4';
+        }
 
-      Object.entries(meta).forEach(([k, v]) => {
-        if (!v) return; // só aplica se tiver valor
-        cmd = cmd.outputOptions(['-metadata', `${k}=${v}`]);
-      });
-
-      cmd.save(outPath);
+        console.log(`[YT-DLP] Download concluído. Tamanho: ${mediaBuffer.length} bytes. Content-Type (Inferido): ${contentType}`);
+        resolve({ buffer: mediaBuffer, contentType: contentType });
     });
-
-    const out = await fs.readFile(outPath);
-    return out;
-  } finally {
-    try { fsSync.existsSync(inPath) && (await fs.unlink(inPath)); } catch { }
-    try { fsSync.existsSync(outPath) && (await fs.unlink(outPath)); } catch { }
-    try { await fs.rmdir(tmpDir); } catch { }
-  }
+  });
 }
 
 // ===================================================================================
-// Mensagens de ajuda / passos
+// Lógica de extração de URL do BTCH-DOWNLOADER
 // ===================================================================================
-function shouldSkipAllMeta(text = '') {
-  return /(^|[\s])\/pulartodos([\s]|$)/i.test(text) || /#pulartodos/i.test(text);
-}
+async function getBtchDownloadUrl(url, method) {
+    let result = null;
+    if (method === 'ttdl') {
+        result = await scraper.ttdl(url);
+    } else if (method === 'ytdl') {
+        result = await scraper.ytdl(url);
+    } else {
+        result = await scraper.downloader(url);
+    }
 
-async function sendInstructions(chatId) {
-  const text =
-    `Envie **um link** do TikTok (ou uma URL direta .mp4).
+    if (!result) {
+        throw new Error('BTCH-DOWNLOADER retornou uma resposta nula.');
+    }
 
-Eu vou perguntar os metadados **um por vez**:
-• título
-• artista
-• comentário
-• descrição
-• gênero
+    // Desaninha se necessário
+    if (result.result && result.result.result) { result = result.result.result; } 
+    else if (result.result) { result = result.result; }
 
-A **data** será preenchida automaticamente com a data de hoje.
-
-Comandos:
-• /pulartodos — pular todos os metadados e enviar do jeito que está
-• /pular — pula o campo atual
-• /cancelar — cancela o processo (também vale /cancel)`;
-  await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
-}
-
-async function askCurrentStep(chatId) {
-  const s = state.get(chatId);
-  const step = META_STEPS[s.stepIndex];
-  await bot.sendMessage(
-    chatId,
-    `Me envie o **${step.label}**.\n(Digite /pular para deixar em branco, /pulartodos para pular todos, ou /cancelar para cancelar)`,
-    { parse_mode: 'Markdown' }
-  );
+    let candidate = result.video_url || result.url ||
+                  (Array.isArray(result.video) ? result.video[0] : result.video) || 
+                  result.downloadUrl || result.link;
+    
+    if (!candidate) throw new Error('BTCH-DOWNLOADER não conseguiu extrair a URL de download.');
+    return candidate;
 }
 
 // ===================================================================================
@@ -405,113 +316,120 @@ bot.on('message', async (msg) => {
   const text = (msg.text || '').trim();
   const chatId = msg.chat.id;
 
-  // Comandos globais
-  if (/^\/cancelar\b/i.test(text) || /^\/cancel\b/i.test(text)) {
-    state.delete(chatId);
-    await bot.sendMessage(chatId, 'Ok, cancelei. Quando quiser é só mandar um link novamente.');
-    return;
-  }
-  if (/^\/start\b/i.test(text)) {
+  // Comandos
+  if (/^\/start\b/i.test(text) || /^\/ajuda\b/i.test(text) || /^\/help\b/i.test(text)) {
     await sendInstructions(chatId);
     return;
   }
-
-  // Se estamos aguardando o valor de um campo de metadado
-  const s = state.get(chatId);
-  if (s && s.awaiting) {
-    // pular TODOS os metadados
-    if (shouldSkipAllMeta(text)) {
-      s.stepIndex = META_STEPS.length; // força concluir
-    }
-    else if (/^\/pular\b/i.test(text)) {
-      s.stepIndex++;
-    } else {
-      const step = META_STEPS[s.stepIndex];
-      const val = sanitizeMetaValue(text);
-      if (val !== undefined) s.meta[step.key] = val; // se vazio, considera "pulado"
-      s.stepIndex++;
-    }
-
-    // Terminou → processa vídeo
-    if (s.stepIndex >= META_STEPS.length) {
-      state.delete(chatId);
-      try {
-        await bot.sendChatAction(chatId, 'upload_video');
-
-        const directUrl = await resolveDirectVideoUrl(s.pendingUrl);
-        const { buffer, contentType } = await downloadToBufferWithType(directUrl, {
-          maxRedirects: 5,
-          timeoutMs: DOWNLOAD_TIMEOUT_MS,
-          headerTimeoutMs: DOWNLOAD_HEADER_TIMEOUT_MS,
-          maxRetries: DOWNLOAD_MAX_RETRIES,
-          maxBytes: 49 * 1024 * 1024
-        });
-
-        if (!/^video\//i.test(contentType)) {
-          await bot.sendMessage(chatId, `A URL resolvida não parece ser vídeo. Content-Type: "${contentType}".`);
-          return;
-        }
-
-        const finalMeta = buildFinalMeta(s.meta); // pode estar vazio, ok!
-        const processed = await rewriteVideoMetadata(buffer, finalMeta);
-
-        await bot.sendVideo(
-          chatId,
-          processed,
-          { caption: 'Prontinho! Vídeo com metadados atualizados.' },
-          { filename: 'video.mp4', contentType: 'video/mp4' }
-        );
-      } catch (err) {
-        console.error(err);
-        await bot.sendMessage(chatId, `Falha ao processar o vídeo: ${err.message}`);
-      }
-      return;
-    }
-
-    // Ainda tem campos → pergunta o próximo
-    await askCurrentStep(chatId);
+  if (/^\/cancelar\b/i.test(text) || /^\/cancel\b/i.test(text)) {
+    await bot.sendMessage(chatId, 'Ok. O processo foi cancelado.');
     return;
   }
 
-  // Não estamos aguardando meta: tenta detectar URL na mensagem
   const url = extractFirstUrl(text);
   if (!url) {
     if (text && text.length < 60) await sendInstructions(chatId);
     return;
   }
 
-  // Inicia o fluxo de metadados
-  state.set(chatId, { awaiting: true, pendingUrl: url, stepIndex: 0, meta: {} });
+  let statusMsg;
+  let finalBuffer;
+  let finalContentType;
+  let usedScraper = '';
 
-  // Se a mensagem já pediu para pular todos, processe direto
-  if (shouldSkipAllMeta(text)) {
-    const s2 = state.get(chatId);
-    s2.stepIndex = META_STEPS.length; // força concluir
-    const fakeMsg = { ...msg, text: '/pulartodos' };
-    return bot.emit('message', fakeMsg);
+  try {
+    // 1. Recebido e Escolhendo Método
+    statusMsg = await bot.sendMessage(chatId, 'Recebido! Resolvendo o link...', {
+      reply_to_message_id: msg.message_id
+    });
+
+    const isTikTok = /tiktok\.com/i.test(url);
+    const isYouTubeShorts = /youtube\.com\/shorts\/|youtu\.be/i.test(url);
+    const isYouTubeOrPinterest = /youtube\.com|youtu\.be|pinterest\.com|pin\.it/i.test(url);
+
+    if (isTikTok) {
+      // === MÉTODO 1: BTCH-DOWNLOADER (Para TikTok) ===
+      usedScraper = 'BTCH-DOWNLOADER';
+      await bot.editMessageText('Link do TikTok detectado. Usando BTCH-DOWNLOADER (Node)...', {
+        chat_id: chatId, message_id: statusMsg.message_id,
+      });
+
+      const directUrl = await getBtchDownloadUrl(url, 'ttdl');
+      
+      const { buffer, contentType } = await downloadToBufferWithType(directUrl, {
+        maxBytes: TELEGRAM_FILE_MAX_BYTES
+      });
+
+      finalBuffer = buffer;
+      finalContentType = contentType;
+
+    } else if (isYouTubeOrPinterest) {
+      // === MÉTODO 2: YT-DLP (Para Pinterest e YouTube/Shorts) ===
+      usedScraper = 'YT-DLP';
+      await bot.editMessageText('Link do Pinterest/YouTube detectado. Usando YT-DLP (Binário)...', {
+        chat_id: chatId, message_id: statusMsg.message_id,
+      });
+
+      const result = await downloadMediaWithYtdlp(url);
+      finalBuffer = result.buffer;
+      finalContentType = result.contentType;
+      
+    } else {
+        throw new Error('Plataforma não suportada. Por favor, envie um link do TikTok, YouTube ou Pinterest.');
+    }
+
+
+    // 2. Enviando
+    await bot.editMessageText(`Download concluído via ${usedScraper}! Enviando...`, {
+      chat_id: chatId,
+      message_id: statusMsg.message_id,
+    });
+
+    // Detecta se é vídeo ou imagem
+    const isVideo = /^video\//i.test(finalContentType) || finalContentType.includes('mp4') || finalContentType.includes('webm') || finalBuffer.length > 2 * 1024 * 1024; // > 2MB é um bom palpite para vídeo
+
+    if (isVideo) {
+      await bot.sendChatAction(chatId, 'upload_video');
+      await bot.sendVideo(
+        chatId,
+        finalBuffer,
+        { caption: `Prontinho! (Fonte: ${usedScraper})` },
+        { filename: 'media.mp4', contentType: 'video/mp4' }
+      );
+    } else {
+      await bot.sendChatAction(chatId, 'upload_photo');
+      await bot.sendPhoto(
+        chatId,
+        finalBuffer,
+        { caption: `Prontinho! (Fonte: ${usedScraper})` },
+        { filename: 'media.jpg', contentType: finalContentType || 'image/jpeg' }
+      );
+    }
+
+    // Apaga a mensagem de status
+    await bot.deleteMessage(chatId, statusMsg.message_id);
+
+  } catch (err) {
+    console.error(`[${chatId}] Falha ao processar ${url}:`, err);
+    const errorText = `❌ Falha ao processar o link (via ${usedScraper}): ${err.message}`;
+    if (statusMsg) {
+      await bot.editMessageText(errorText, {
+        chat_id: chatId,
+        message_id: statusMsg.message_id,
+      });
+    } else {
+      await bot.sendMessage(chatId, errorText);
+    }
   }
-
-  await bot.sendMessage(
-    chatId,
-    'Link recebido! Vou perguntar os metadados um por vez.\n' +
-    'Você pode usar /pular para deixar algum em branco, /pulartodos para pular todos, ou /cancelar para cancelar.'
-  );
-  await askCurrentStep(chatId);
 });
 
 // ===================================================================================
-// Boot: remover webhook e iniciar polling (compat com versões)
+// Boot: remover webhook e iniciar polling
 // ===================================================================================
 (async () => {
   try {
-    if (typeof bot.deleteWebHook === 'function') {
-      await bot.deleteWebHook({ drop_pending_updates: true });
-    } else if (typeof bot.deleteWebhook === 'function') {
-      await bot.deleteWebhook({ drop_pending_updates: true });
-    } else if (typeof bot.setWebHook === 'function') {
-      await bot.setWebHook('', { drop_pending_updates: true });
-    }
-
+    await bot.deleteWebHook({ drop_pending_updates: true }).catch(() => {});
+    
     await bot.startPolling();
     console.log('[BOT] Polling iniciado.');
   } catch (e) {
@@ -520,8 +438,8 @@ bot.on('message', async (msg) => {
   }
 })();
 
-// Encerramento limpo (evita sessão paralela em redeploy)
+// Encerramento limpo
 process.on('SIGTERM', async () => { try { await bot.stopPolling(); } catch { } process.exit(0); });
 process.on('SIGINT', async () => { try { await bot.stopPolling(); } catch { } process.exit(0); });
 
-console.log('✅ Bot rodando. Pressione Ctrl+C para encerrar.');
+console.log('✅ Bot rodando (TikTok: Node | Pinterest/YouTube: yt-dlp). Pressione Ctrl+C para encerrar.');
