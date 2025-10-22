@@ -1,44 +1,40 @@
-# Use a imagem base oficial do Node.js (LTS, slim para ser menor)
-FROM node:20-slim
+# ---- Base: Node + ffmpeg + yt-dlp ----
+FROM node:20-bookworm-slim
 
-# === 1. INSTALAÇÃO DE DEPENDÊNCIAS DE SISTEMA ===
-# Adiciona utilitários básicos (procps = ps, grep), Python, venv e ffmpeg
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv \
-    ffmpeg \
-    procps \
-    && rm -rf /var/lib/apt/lists/*
+# Evita prompts interativos
+ENV DEBIAN_FRONTEND=noninteractive
+ENV NODE_ENV=production
+# Opcional (teu código já usa esse path por padrão):
+ENV YTDLP_PATH=/usr/local/bin/yt-dlp
 
-# === 2. INSTALAÇÃO DO YT-DLP EM AMBIENTE VIRTUAL ===
-# Cria um ambiente virtual temporário para evitar o erro 'externally-managed-environment'
-ENV VIRTUAL_ENV=/opt/venv
-RUN python3 -m venv $VIRTUAL_ENV
+# Sistema: ffmpeg, python3/pip para instalar yt-dlp, e libs básicas
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+       ca-certificates curl python3 python3-pip ffmpeg \
+  && pip3 install --no-cache-dir yt-dlp \
+  && apt-get purge -y --auto-remove \
+  && rm -rf /var/lib/apt/lists/*
 
-# Adiciona o ambiente virtual ao PATH
-ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+# Diretório da app
+WORKDIR /app
 
-# Instala o yt-dlp dentro do ambiente virtual (agora deve funcionar)
-RUN pip install yt-dlp
+# Copia apenas manifestos para cache de dependências
+COPY package*.json ./
 
-# Move o binário yt-dlp para um local global (/usr/local/bin) e limpa o venv
-RUN mv $VIRTUAL_ENV/bin/yt-dlp /usr/local/bin/yt-dlp && \
-    rm -rf $VIRTUAL_ENV
+# Instala só dependências de produção
+RUN npm ci --omit=dev
 
-# === 3. CONFIGURAÇÃO DA APLICAÇÃO NODE.JS ===
-WORKDIR /usr/src/app
-COPY package.json package-lock.json ./
-RUN npm install --omit=dev
+# Copia o resto do projeto
 COPY . .
 
-# === 4. CONFIGURAÇÕES DE AMBIENTE ===
-ENV NODE_ENV production
-ENV YTDLP_PATH yt-dlp
-ENV FFMPEG_PATH ffmpeg
+# Garante permissões para usuário não-root
+RUN chown -R node:node /app
+USER node
 
-# === 5. HEALTHCHECK E COMANDO (Agora com 'ps' e 'grep' disponíveis) ===
-# Healthcheck: Verifica a cada 10s se o processo 'node' principal ainda está ativo.
-HEALTHCHECK --interval=10s --timeout=5s --start-period=10s \
-  CMD ["sh", "-c", "ps aux | grep -v grep | grep node || exit 1"]
+# Não expomos portas: é um bot por polling (saída apenas)
+# Opcional: healthcheck simples (confirma que o processo Node está vivo)
+# HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+#   CMD node -e "process.exit(0)"
 
+# Comando de inicialização
 CMD ["node", "bot.js"]
