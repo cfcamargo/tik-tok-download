@@ -11,9 +11,8 @@ const { URL } = require('node:url');
 const fs = require('node:fs');
 const { execFile } = require('node:child_process');
 
-// === BIBLIOTECA SCRAPER ===
-// Usado apenas para TikTok
-const scraper = require('btch-downloader');
+// === BIBLIOTECAS DE SCRAPER NODE.JS ===
+const scraper = require('btch-downloader'); // Usado apenas para TikTok
 
 // ===================================================================================
 // Configurações de Download e Agentes
@@ -32,29 +31,26 @@ const HTTPS_AGENT = new https.Agent({ keepAlive: true, maxSockets: 20 });
 // ===================================================================================
 let ffmpegPath = process.env.FFMPEG_PATH || 'ffmpeg';
 
+// resolve o caminho do yt-dlp de forma resiliente (sem alterar a lógica do TikTok)
 function pickYtDlpPath() {
   const candidates = [
-    process.env.YTDLP_PATH,
+    process.env.YTDLP_PATH,          // env (ex.: /usr/local/bin/yt-dlp)
     '/usr/local/bin/yt-dlp',
     '/usr/bin/yt-dlp',
-    'yt-dlp',
+    'yt-dlp',                        // via PATH
   ].filter(Boolean);
 
   for (const p of candidates) {
     try {
-      if (!p.includes('/')) return p; // deixa o execFile resolver pelo PATH
+      if (!p.includes('/')) return p;     // deixa o execFile resolver pelo PATH
       if (fs.existsSync(p)) return p;
     } catch {}
   }
   return 'yt-dlp';
 }
-
 const YTDLP_PATH = pickYtDlpPath();
 
-// Cookies opcionais para Pinterest (linha única, ex.: "cookie1=...; cookie2=...")
-const PINTEREST_COOKIES = (process.env.PINTEREST_COOKIES || '').trim();
-
-// Log de binários
+// Logs de versão (apenas diagnóstico)
 execFile(YTDLP_PATH, ['--version'], (e, out) => {
   if (e) console.error('[YT-DLP] yt-dlp indisponível:', e.message);
   else console.log('[YT-DLP] Versão:', (out || '').split('\n')[0]);
@@ -109,46 +105,17 @@ async function replyNotAllowed(msg) {
 }
 
 // ===================================================================================
-// Utils gerais
+// Utils / HTTP helpers
 // ===================================================================================
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-function extractFirstUrl(text = '') {
-  const m = text.match(/https?:\/\/\S+/i);
-  return m ? m[0].replace(/[)\]}>"'\s]+$/, '') : null;
-}
-
-async function sendInstructions(chatId) {
-  const text = `👋 Envie um link:
-• TikTok → uso btch-downloader
-• Pinterest → uso yt-dlp
-• YouTube Shorts (ou YouTube) → uso yt-dlp
-
-Comandos:
-• /start ou /ajuda — esta mensagem
-• /cancelar — cancela o processo
-
-Dicas:
-• Links encurtados (pin.it) eu expando automaticamente.
-• Limite do Telegram: ~50MB por arquivo.
-• Pinterest às vezes exige cookies; se necessário, defina a env PINTEREST_COOKIES.`;
-  try {
-    await bot.sendMessage(chatId, text, { disable_web_page_preview: true });
-  } catch {}
-}
-
-// ===================================================================================
-// HTTP: stream / download helpers
-// ===================================================================================
 async function getStream(urlStr, opts = {}) {
   const {
-    method = 'GET',
     maxRedirects = 5,
     timeoutMs = DOWNLOAD_TIMEOUT_MS,
     headerTimeoutMs = DOWNLOAD_HEADER_TIMEOUT_MS,
     attempt = 1,
     maxRetries = DOWNLOAD_MAX_RETRIES,
-    headers: extraHeaders = {},
   } = opts;
 
   if (maxRedirects < 0) throw new Error('Too many redirects');
@@ -160,11 +127,11 @@ async function getStream(urlStr, opts = {}) {
 
   const headers = {
     'User-Agent':
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+      '(KHTML, like Gecko) Chrome/125 Safari/537.36',
     'Accept': '*/*',
     'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
     'Referer': 'https://www.google.com/',
-    ...extraHeaders,
   };
 
   const overallDeadline = Date.now() + timeoutMs;
@@ -173,13 +140,13 @@ async function getStream(urlStr, opts = {}) {
     new Promise((resolve, reject) => {
       const req = client.request(
         {
-          method,
+          method: 'GET',
           hostname: url.hostname,
           port: url.port || (isHttps ? 443 : 80),
           path: url.pathname + url.search,
           headers,
           agent,
-          family: 4,
+          family: 4, // força IPv4
         },
         (res) => {
           const status = res.statusCode || 0;
@@ -187,7 +154,11 @@ async function getStream(urlStr, opts = {}) {
           if (status >= 300 && status < 400 && res.headers.location) {
             const next = new URL(res.headers.location, url).toString();
             res.resume();
-            getStream(next, { ...opts, maxRedirects: maxRedirects - 1 }).then(resolve).catch(reject);
+            getStream(next, {
+              ...opts,
+              maxRedirects: maxRedirects - 1,
+              timeoutMs: Math.max(1000, overallDeadline - Date.now()),
+            }).then(resolve).catch(reject);
             return;
           }
 
@@ -198,14 +169,26 @@ async function getStream(urlStr, opts = {}) {
           }
 
           res._contentType = res.headers['content-type'] || '';
-          res._finalUrl = url.toString();
           resolve(res);
         }
       );
 
-      req.setTimeout(headerTimeoutMs, () => req.destroy(new Error('Header timeout')));
-      const overallTimer = setTimeout(() => req.destroy(new Error('Request timeout')), timeoutMs);
-      req.on('error', (e) => { clearTimeout(overallTimer); reject(e); });
+      // Timeout para cabeçalhos
+      req.setTimeout(
+        Math.min(headerTimeoutMs, Math.max(1, overallDeadline - Date.now())),
+        () => req.destroy(new Error('Header timeout'))
+      );
+
+      // Deadline total
+      const overallTimer = setTimeout(() => {
+        req.destroy(new Error('Request timeout'));
+      }, Math.max(1, overallDeadline - Date.now()));
+
+      req.on('error', (e) => {
+        clearTimeout(overallTimer);
+        reject(e);
+      });
+
       req.end();
     });
 
@@ -214,7 +197,9 @@ async function getStream(urlStr, opts = {}) {
   } catch (err) {
     if (attempt < maxRetries) {
       const backoff = DOWNLOAD_RETRY_BASE_MS * Math.pow(2, attempt - 1);
-      console.warn(`[HTTP] Falha (tentativa ${attempt}/${maxRetries}): ${err.message}`);
+      console.warn(
+        `[HTTP] Falha (tentativa ${attempt}/${maxRetries}): ${err.message} — retry em ${backoff}ms`
+      );
       await sleep(backoff);
       return getStream(urlStr, { ...opts, attempt: attempt + 1 });
     }
@@ -224,8 +209,7 @@ async function getStream(urlStr, opts = {}) {
 
 function streamToBuffer(stream, maxBytes) {
   return new Promise((resolve, reject) => {
-    const chunks = [];
-    let total = 0;
+    const chunks = []; let total = 0;
     stream.on('data', (chunk) => {
       const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       total += buf.length;
@@ -248,41 +232,35 @@ async function downloadToBufferWithType(url, opts = {}) {
   return { buffer: buf, contentType: res._contentType };
 }
 
-// Expande encurtadores (ex.: pin.it -> pinterest.com/pin/…)
-async function expandUrl(urlStr) {
+// Helpers gerais
+function extractFirstUrl(text = '') {
+  const m = text.match(/https?:\/\/\S+/i);
+  return m ? m[0].replace(/[)\]}>"'\s]+$/, '') : null;
+}
+
+async function sendInstructions(chatId) {
+  const text = `👋 Envie um link do TikTok, YouTube/Shorts ou Pinterest que eu baixo pra você.
+
+Comandos:
+• /start ou /ajuda — esta mensagem
+• /cancelar — cancela o processo
+
+Dicas:
+• Limite do Telegram: ~50MB por arquivo.
+• Pinterest pode exigir cookies/env (PINTEREST_COOKIES) em alguns casos.`;
   try {
-    const res = await getStream(urlStr, { method: 'GET', maxRedirects: 5 });
-    return res._finalUrl || urlStr;
-  } catch {
-    return urlStr;
-  }
+    await bot.sendMessage(chatId, text, { disable_web_page_preview: true });
+  } catch {}
 }
 
 // ===================================================================================
-// TikTok via btch-downloader (somente TikTok)
-// ===================================================================================
-async function getTikTokDirectUrl(url) {
-  const result = await scraper.ttdl(url);
-  if (!result) throw new Error('btch-downloader (ttdl) retornou nulo.');
-
-  let r = result;
-  if (r.result && r.result.result) r = r.result.result;
-  else if (r.result) r = r.result;
-
-  const candidate = r.video_url || r.url ||
-    (Array.isArray(r.video) ? r.video[0] : r.video) ||
-    r.downloadUrl || r.link;
-
-  if (!candidate) throw new Error('btch-downloader (ttdl) não conseguiu extrair a URL.');
-  return candidate;
-}
-
-// ===================================================================================
-// Pinterest / YouTube (Shorts) via yt-dlp
+// YT-DLP: Download de Mídia (Binário) - Para Pinterest/YouTube/Shorts
 // ===================================================================================
 async function downloadMediaWithYtdlp(url) {
+  // Estratégia: força saída mp4 na saída padrão (pipe) com ffmpeg
   const args = [
     '--ignore-config',
+    '--force-ipv4',
     '-f', 'best',
     '--recode-video', 'mp4',
     '-o', '-',
@@ -293,44 +271,69 @@ async function downloadMediaWithYtdlp(url) {
     '--no-progress',
     '--quiet',
     '--ffmpeg-location', ffmpegPath,
-    '--concurrent-fragments', '1',
-
-    // Headers úteis
-    '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36',
-    '--add-header', 'Accept-Language: pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
-    '--add-header', 'Referer: https://www.pinterest.com/',
-    '--geo-bypass',
+    url
   ];
 
-  if (PINTEREST_COOKIES) {
-    args.push('--add-header', `Cookie: ${PINTEREST_COOKIES}`);
-  }
-
-  args.push(url);
-
   return new Promise((resolve, reject) => {
-    const child = execFile(YTDLP_PATH, args, { encoding: 'buffer', maxBuffer: TELEGRAM_FILE_MAX_BYTES },
+    const child = execFile(
+      YTDLP_PATH,
+      args,
+      { encoding: 'buffer', maxBuffer: TELEGRAM_FILE_MAX_BYTES },
       (error, stdout, stderr) => {
         if (error) {
-          const errStr = stderr.toString();
-          console.error('[YT-DLP] Erro (STDERR):', errStr.substring(0, 800));
-          return reject(new Error(`YT-DLP falhou (código ${error.code}).`));
+          console.error('[YT-DLP] Erro (STDERR):', (stderr || '').toString().substring(0, 600));
+          const errMsg = (stderr || '').toString().includes('Requested format is not available')
+            ? 'O conteúdo de vídeo está em um formato incomum. YT-DLP não conseguiu baixá-lo.'
+            : `O binário YT-DLP falhou. Código: ${error.code}.`;
+          return reject(new Error(errMsg));
         }
 
         const mediaBuffer = Buffer.from(stdout);
-        if (mediaBuffer.length === 0) return reject(new Error('YT-DLP retornou arquivo vazio.'));
+        if (mediaBuffer.length === 0) return reject(new Error('YT-DLP retornou um arquivo vazio.'));
 
+        // Inferência simples de content-type
         let contentType = 'application/octet-stream';
         const header = mediaBuffer.subarray(0, 4).toString('hex');
         if (header.includes('ffd8')) contentType = 'image/jpeg';
-        else if (header.includes('000000') && mediaBuffer.subarray(4, 8).toString().includes('ftyp'))
-          contentType = 'video/mp4';
+        else if (header.includes('000000') && mediaBuffer.subarray(4, 8).toString().includes('ftyp')) contentType = 'video/mp4';
         else if (mediaBuffer.length > 2 * 1024 * 1024) contentType = 'video/mp4';
 
-        console.log(`[YT-DLP] Download concluído. ${mediaBuffer.length} bytes.`);
+        console.log(`[YT-DLP] Download concluído. Tamanho: ${mediaBuffer.length} bytes. Content-Type (Inferido): ${contentType}`);
         resolve({ buffer: mediaBuffer, contentType });
-      });
+      }
+    );
   });
+}
+
+// ===================================================================================
+// BTCH-DOWNLOADER: extração de URL (TikTok como no seu exemplo que funcionava)
+// ===================================================================================
+async function getBtchDownloadUrl(url, method) {
+  let result = null;
+  if (method === 'ttdl') {
+    result = await scraper.ttdl(url);
+  } else if (method === 'ytdl') {
+    result = await scraper.ytdl(url);
+  } else {
+    // OBS: manter como estava — não usamos 'downloader' para TikTok
+    result = await scraper.downloader(url);
+  }
+
+  if (!result) throw new Error('BTCH-DOWNLOADER retornou uma resposta nula.');
+
+  // Desaninha se necessário
+  if (result.result && result.result.result) result = result.result.result;
+  else if (result.result) result = result.result;
+
+  const candidate =
+    result.video_url ||
+    result.url ||
+    (Array.isArray(result.video) ? result.video[0] : result.video) ||
+    result.downloadUrl ||
+    result.link;
+
+  if (!candidate) throw new Error('BTCH-DOWNLOADER não conseguiu extrair a URL de download.');
+  return candidate;
 }
 
 // ===================================================================================
@@ -342,63 +345,112 @@ bot.on('message', async (msg) => {
   const text = (msg.text || '').trim();
   const chatId = msg.chat.id;
 
-  if (/^\/start\b|^\/ajuda\b|^\/help\b/i.test(text)) return sendInstructions(chatId);
-  if (/^\/cancelar\b|^\/cancel\b/i.test(text)) return bot.sendMessage(chatId, 'Ok. Cancelado.');
+  // Comandos
+  if (/^\/start\b/i.test(text) || /^\/ajuda\b/i.test(text) || /^\/help\b/i.test(text)) {
+    await sendInstructions(chatId);
+    return;
+  }
+  if (/^\/cancelar\b/i.test(text) || /^\/cancel\b/i.test(text)) {
+    await bot.sendMessage(chatId, 'Ok. O processo foi cancelado.');
+    return;
+  }
 
-  const url0 = extractFirstUrl(text);
-  if (!url0) {
+  const url = extractFirstUrl(text);
+  if (!url) {
     if (text && text.length < 60) await sendInstructions(chatId);
     return;
   }
 
-  let statusMsg, finalBuffer, finalContentType, usedScraper = '';
-  try {
-    statusMsg = await bot.sendMessage(chatId, 'Recebido! Resolvendo o link...', { reply_to_message_id: msg.message_id });
+  let statusMsg;
+  let finalBuffer;
+  let finalContentType;
+  let usedScraper = '';
 
-    // Expande encurtadores (especialmente pin.it)
-    const url = await expandUrl(url0);
+  try {
+    // 1. Recebido e Escolhendo Método
+    statusMsg = await bot.sendMessage(chatId, 'Recebido! Resolvendo o link...', {
+      reply_to_message_id: msg.message_id
+    });
+
     const isTikTok = /tiktok\.com/i.test(url);
-    const isPinterest = /pinterest\.com/i.test(url) || /pin\.it/i.test(url0);
-    const isYouTube = /youtube\.com|youtu\.be/i.test(url); // inclui Shorts
+    const isYouTubeOrPinterest = /youtube\.com|youtu\.be|pinterest\.com|pin\.it/i.test(url);
 
     if (isTikTok) {
-      usedScraper = 'btch-downloader (TikTok)';
-      await bot.editMessageText('Link do TikTok detectado. Usando btch-downloader...', { chat_id: chatId, message_id: statusMsg.message_id });
-      const directUrl = await getTikTokDirectUrl(url);
-      const { buffer, contentType } = await downloadToBufferWithType(directUrl, { maxBytes: TELEGRAM_FILE_MAX_BYTES });
-      finalBuffer = buffer; finalContentType = contentType;
-    } else if (isPinterest || isYouTube) {
-      usedScraper = 'yt-dlp';
-      await bot.editMessageText(`Link ${isPinterest ? 'do Pinterest' : 'do YouTube'} detectado. Usando yt-dlp...`, { chat_id: chatId, message_id: statusMsg.message_id });
+      // === ✅ TikTok como no seu exemplo antigo (que funcionava) ===
+      usedScraper = 'BTCH-DOWNLOADER';
+      await bot.editMessageText('Link do TikTok detectado. Usando BTCH-DOWNLOADER (Node)...', {
+        chat_id: chatId, message_id: statusMsg.message_id,
+      });
 
-      // Sem fallback: se falhar, retorna erro claro
+      // Mantido exatamente: ttdl -> download direto
+      const directUrl = await getBtchDownloadUrl(url, 'ttdl');
+      const { buffer, contentType } = await downloadToBufferWithType(directUrl, {
+        maxBytes: TELEGRAM_FILE_MAX_BYTES
+      });
+
+      finalBuffer = buffer;
+      finalContentType = contentType;
+
+    } else if (isYouTubeOrPinterest) {
+      // === Pinterest/YouTube via yt-dlp ===
+      usedScraper = 'YT-DLP';
+      await bot.editMessageText('Link do Pinterest/YouTube detectado. Usando YT-DLP (Binário)...', {
+        chat_id: chatId, message_id: statusMsg.message_id,
+      });
+
       const result = await downloadMediaWithYtdlp(url);
-      finalBuffer = result.buffer; finalContentType = result.contentType;
+      finalBuffer = result.buffer;
+      finalContentType = result.contentType;
+
     } else {
-      throw new Error('Plataforma não suportada. Envie link do TikTok, Pinterest ou YouTube/Shorts.');
+      throw new Error('Plataforma não suportada. Por favor, envie um link do TikTok, YouTube ou Pinterest.');
     }
 
-    await bot.editMessageText(`Download concluído via ${usedScraper}! Enviando...`, { chat_id: chatId, message_id: statusMsg.message_id });
+    // 2. Enviando
+    await bot.editMessageText(`Download concluído via ${usedScraper}! Enviando...`, {
+      chat_id: chatId,
+      message_id: statusMsg.message_id,
+    });
 
-    const isVideo = /^video\//i.test(finalContentType) || finalBuffer.length > 2 * 1024 * 1024;
+    // Detecta se é vídeo ou imagem
+    const isVideo =
+      /^video\//i.test(finalContentType) ||
+      (finalContentType || '').includes('mp4') ||
+      (finalContentType || '').includes('webm') ||
+      finalBuffer.length > 2 * 1024 * 1024; // > 2MB é um bom palpite para vídeo
+
     if (isVideo) {
       await bot.sendChatAction(chatId, 'upload_video');
-      await bot.sendVideo(chatId, finalBuffer, { caption: `Prontinho! (Fonte: ${usedScraper})` }, { filename: 'media.mp4', contentType: 'video/mp4' });
+      await bot.sendVideo(
+        chatId,
+        finalBuffer,
+        { caption: `Prontinho! (Fonte: ${usedScraper})` },
+        { filename: 'media.mp4', contentType: 'video/mp4' }
+      );
     } else {
       await bot.sendChatAction(chatId, 'upload_photo');
-      await bot.sendPhoto(chatId, finalBuffer, { caption: `Prontinho! (Fonte: ${usedScraper})` }, { filename: 'media.jpg', contentType: finalContentType || 'image/jpeg' });
+      await bot.sendPhoto(
+        chatId,
+        finalBuffer,
+        { caption: `Prontinho! (Fonte: ${usedScraper})` },
+        { filename: 'media.jpg', contentType: finalContentType || 'image/jpeg' }
+      );
     }
 
+    // Apaga a mensagem de status
     await bot.deleteMessage(chatId, statusMsg.message_id);
+
   } catch (err) {
-    console.error(`[${chatId}] Falha ao processar ${url0}:`, err);
-    const extra =
-      /pinterest/i.test(url0) && !PINTEREST_COOKIES
-        ? '\n⚠️ Dica: Para alguns pins, defina PINTEREST_COOKIES na Environment (linha única com cookies do Pinterest).'
-        : '';
-    const errorText = `❌ Falha ao processar o link (via ${usedScraper || 'desconhecido'}): ${err.message}${extra}`;
-    if (statusMsg) await bot.editMessageText(errorText, { chat_id: chatId, message_id: statusMsg.message_id });
-    else await bot.sendMessage(chatId, errorText);
+    console.error(`[${chatId}] Falha ao processar ${url}:`, err);
+    const errorText = `❌ Falha ao processar o link (via ${usedScraper || 'desconhecido'}): ${err.message}`;
+    if (statusMsg) {
+      await bot.editMessageText(errorText, {
+        chat_id: chatId,
+        message_id: statusMsg.message_id,
+      });
+    } else {
+      await bot.sendMessage(chatId, errorText);
+    }
   }
 });
 
@@ -416,7 +468,8 @@ bot.on('message', async (msg) => {
   }
 })();
 
+// Encerramento limpo
 process.on('SIGTERM', async () => { try { await bot.stopPolling(); } catch {} process.exit(0); });
 process.on('SIGINT', async () => { try { await bot.stopPolling(); } catch {} process.exit(0); });
 
-console.log('✅ Bot rodando (TikTok → btch-downloader | Pinterest/YouTube → yt-dlp). Pressione Ctrl+C para encerrar.');
+console.log('✅ Bot rodando (TikTok: Node | Pinterest/YouTube: yt-dlp). Pressione Ctrl+C para encerrar.');
